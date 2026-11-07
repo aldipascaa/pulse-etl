@@ -1,4 +1,94 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>PulseETL</title>
-<link rel="stylesheet" href="/style.css"></head>
-<body><h1>PulseETL</h1><div id="app"></div><script src="/app.js"></script></body></html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PulseETL Dashboard</title>
+<meta name="description" content="Pipeline health and weather analytics served by PulseETL">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script>
+  try {
+    var t = localStorage.getItem("pulse-theme");
+    if (t) document.documentElement.setAttribute("data-theme", t);
+  } catch (e) {}
+</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="top">
+  <div class="brand">
+    <svg viewBox="0 0 32 32" width="28" height="28" aria-hidden="true"><rect width="32" height="32" rx="7" fill="var(--accent)"/><path d="M4 17h6l3-8 5 15 3-9h7" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <span class="brand-name">PulseETL</span>
+    <span id="health" class="pill" role="status">connecting…</span>
+  </div>
+  <div class="actions">
+    <button id="theme" class="btn ghost" type="button" aria-label="Toggle light or dark theme">
+      <span id="theme-icon" aria-hidden="true">◐</span><span class="btn-text">Theme</span>
+    </button>
+    <button id="run" class="btn primary" type="button">
+      <span class="spinner" aria-hidden="true"></span><span id="run-label">Run now</span>
+    </button>
+  </div>
+</header>
+
+<main id="main" tabindex="-1">
+  <section class="controls" aria-label="Chart selection">
+    <div class="field">
+      <label for="city">City</label>
+      <select id="city"></select>
+    </div>
+    <fieldset class="field seg">
+      <legend>Metric</legend>
+      <div id="metric" class="seg-group" role="radiogroup"></div>
+    </fieldset>
+  </section>
+
+  <section class="kpis" aria-label="Key figures" id="kpis"></section>
+
+  <section class="card" aria-labelledby="chart-title">
+    <div class="card-head">
+      <h2 id="chart-title">Daily series</h2>
+      <ul class="legend" aria-hidden="true">
+        <li><i class="sw sw-band"></i>Min–max</li>
+        <li><i class="sw sw-avg"></i>Daily average</li>
+        <li><i class="sw sw-roll"></i>7-day average</li>
+        <li><i class="sw sw-anom"></i>Anomaly</li>
+      </ul>
+    </div>
+    <div id="chart" class="chart"></div>
+    <details class="datatable">
+      <summary>View chart data as a table</summary>
+      <div class="table-wrap" tabindex="0" role="region" aria-label="Chart data table"><table id="data-table"></table></div>
+    </details>
+  </section>
+
+  <div class="two-col">
+    <section class="card" aria-labelledby="cmp-title">
+      <div class="card-head"><h2 id="cmp-title">All cities</h2><span class="muted" id="cmp-sub"></span></div>
+      <div id="cities" class="spark-grid"></div>
+    </section>
+    <section class="card" aria-labelledby="anom-title">
+      <div class="card-head"><h2 id="anom-title">Recent anomalies</h2><span class="muted">|z| ≥ threshold</span></div>
+      <ul id="anomalies" class="anom-list"></ul>
+    </section>
+  </div>
+
+  <section class="card" aria-labelledby="runs-title">
+    <div class="card-head"><h2 id="runs-title">Pipeline runs</h2><span class="muted" id="runs-sub"></span></div>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Pipeline run history">
+      <table id="runs" class="runs">
+        <thead><tr><th>Run</th><th>Status</th><th>Source</th><th>Started</th><th>Duration</th><th class="num">In</th><th class="num">Loaded</th><th class="num">Rejected</th><th>Notes</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">PulseETL v<span id="ver">–</span> · weather data from <a href="https://open-meteo.com/" rel="noopener">Open-Meteo</a> or local CSV</footer>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<script src="/app.js"></script>
+</body>
+</html>
