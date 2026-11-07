@@ -1,0 +1,30 @@
+[package]
+name = "pulse-etl"
+version = "1.0.0"
+edition = "2021"
+description = "PulseETL: a small ETL pipeline (Open-Meteo / CSV -> SQLite) with a JSON API and analytics dashboard"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive", "env"] }
+csv = "1"
+reqwest = { version = "0.12", features = ["json"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+lto = "thin"
+strip = true
