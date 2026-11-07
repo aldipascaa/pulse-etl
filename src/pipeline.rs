@@ -1,86 +1,109 @@
-//! Orchestrates extract -> transform -> load and records every execution in `runs`.
+//! Orchestrates extract -> transform -> load and records every execution as a run.
+//!
+//! The pipeline only knows the [`Source`] and [`Sink`] traits, so both ends can be swapped
+//! (or faked in tests). The SQLite implementation of [`Sink`] lives in [`crate::db`].
 
-use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::Arc;
 
-use anyhow::Result;
+use async_trait::async_trait;
 
-use crate::db::Db;
-use crate::extract;
-use crate::model::{RawRow, RunRecord};
-use crate::transform::{clean, DEFAULT_Z_THRESHOLD};
+use crate::error::StoreError;
+use crate::extract::Source;
+use crate::model::{RawRow, Reading, RunRecord, RunStatus, SourceFailure};
+use crate::transform::{clean, AnomalyConfig, CleanOutcome};
 
-/// Where data comes from.
+/// Final numbers of a run, handed to the sink when the run is closed.
 #[derive(Debug, Clone)]
-pub enum Source {
-    /// Open-Meteo public API (no key).
-    Api,
-    /// Local CSV file (works offline).
-    Csv(PathBuf),
+pub struct RunOutcome {
+    pub status: RunStatus,
+    pub rows_in: usize,
+    pub rows_out: usize,
+    pub rows_rejected: usize,
+    pub message: Option<String>,
+    pub failures: Vec<SourceFailure>,
 }
 
-impl Source {
-    pub fn label(&self) -> String {
-        match self {
-            Source::Api => "open-meteo".to_string(),
-            Source::Csv(p) => format!("csv:{}", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
+impl RunOutcome {
+    fn failed(message: String, failures: Vec<SourceFailure>) -> Self {
+        RunOutcome { status: RunStatus::Failed, rows_in: 0, rows_out: 0, rows_rejected: 0, message: Some(message), failures }
+    }
+}
+
+/// Destination of the load stage and the run ledger.
+#[async_trait]
+pub trait Sink: Send + Sync {
+    /// Open a run and return its id.
+    async fn start_run(&self, source: &str) -> Result<i64, StoreError>;
+    /// Idempotently store the readings and refresh whatever is derived from them.
+    async fn load(&self, readings: Vec<Reading>, anomaly: AnomalyConfig) -> Result<(), StoreError>;
+    /// Close a run with its outcome and return the stored record.
+    async fn finish_run(&self, id: i64, outcome: RunOutcome) -> Result<RunRecord, StoreError>;
+}
+
+pub struct Pipeline {
+    source: Arc<dyn Source>,
+    sink: Arc<dyn Sink>,
+    anomaly: AnomalyConfig,
+}
+
+impl Pipeline {
+    pub fn new(source: Arc<dyn Source>, sink: Arc<dyn Sink>, anomaly: AnomalyConfig) -> Self {
+        Pipeline { source, sink, anomaly }
+    }
+
+    pub fn source_label(&self) -> String {
+        self.source.label()
+    }
+
+    /// Run the pipeline once. Extraction and load problems are recorded as a `failed` run and
+    /// returned as `Ok(record)`; `Err` is reserved for the run ledger itself being unusable.
+    pub async fn run(&self) -> Result<RunRecord, StoreError> {
+        let id = self.sink.start_run(&self.source.label()).await?;
+        match self.source.extract().await {
+            Ok(extraction) => self.process(id, extraction.rows, extraction.failures).await,
+            Err(e) => {
+                tracing::error!("run #{id}: extract failed: {e}");
+                self.sink.finish_run(id, RunOutcome::failed(format!("extract failed: {e}"), Vec::new())).await
+            }
         }
     }
-}
 
-#[derive(Debug, Clone)]
-pub struct PipelineConfig {
-    pub z_threshold: f64,
-    pub past_days: u32,
-    pub attempts: u32,
-    pub backoff: Duration,
-    pub api_url: String,
-}
-
-impl Default for PipelineConfig {
-    fn default() -> Self {
-        PipelineConfig {
-            z_threshold: DEFAULT_Z_THRESHOLD,
-            past_days: 14,
-            attempts: 4,
-            backoff: Duration::from_secs(2),
-            api_url: extract::OPEN_METEO_URL.to_string(),
+    async fn process(&self, id: i64, rows: Vec<RawRow>, failures: Vec<SourceFailure>) -> Result<RunRecord, StoreError> {
+        let cleaned = tokio::task::spawn_blocking(move || clean(&rows)).await;
+        let CleanOutcome { readings, rows_in, rows_ok, rejected } = match cleaned {
+            Ok(c) => c,
+            Err(e) => {
+                return self.sink.finish_run(id, RunOutcome::failed(format!("transform failed: {e}"), failures)).await;
+            }
+        };
+        if let Err(e) = self.sink.load(readings, self.anomaly).await {
+            tracing::error!("run #{id}: load failed: {e}");
+            let outcome = RunOutcome {
+                rows_in,
+                rows_rejected: rejected.len(),
+                ..RunOutcome::failed(format!("load failed: {e}"), failures)
+            };
+            return self.sink.finish_run(id, outcome).await;
         }
-    }
-}
 
-/// Transform + load already-extracted rows into an open run.
-fn process(db: &Db, run_id: i64, rows: &[RawRow], cfg: &PipelineConfig) -> Result<RunRecord> {
-    let out = clean(rows);
-    if let Err(e) = db.load(&out.readings, cfg.z_threshold) {
-        return db.finish_run(run_id, "failed", out.rows_in, 0, out.rejected.len(), Some(&format!("load failed: {e:#}")));
-    }
-    let rejected = out.rejected.len();
-    let (status, message) = if rejected == 0 {
-        ("success", None)
-    } else {
-        let sample: Vec<String> = out.rejected.iter().take(3).map(|r| format!("row {}: {}", r.row, r.reason)).collect();
-        ("partial", Some(format!("{rejected} rows rejected; e.g. {}", sample.join("; "))))
-    };
-    db.finish_run(run_id, status, out.rows_in, out.rows_ok, rejected, message.as_deref())
-}
-
-/// Run the transform and load stages on in-memory rows (used by tests and CSV ingestion).
-pub fn ingest_rows(db: &Db, source_label: &str, rows: &[RawRow], cfg: &PipelineConfig) -> Result<RunRecord> {
-    let id = db.start_run(source_label)?;
-    process(db, id, rows, cfg)
-}
-
-/// Full pipeline. Extraction/load problems are recorded as a `failed` run and returned
-/// as `Ok(record)`; `Err` is reserved for the run table itself being unusable.
-pub async fn run_ingest(db: &Db, source: &Source, cfg: &PipelineConfig) -> Result<RunRecord> {
-    let id = db.start_run(&source.label())?;
-    let extracted = match source {
-        Source::Csv(path) => extract::read_csv(path),
-        Source::Api => extract::fetch_open_meteo(&cfg.api_url, cfg.past_days, cfg.attempts, cfg.backoff).await,
-    };
-    match extracted {
-        Ok(rows) => process(db, id, &rows, cfg),
-        Err(e) => db.finish_run(id, "failed", 0, 0, 0, Some(&format!("extract failed: {e:#}"))),
+        let mut notes = Vec::new();
+        if !rejected.is_empty() {
+            let sample: Vec<String> = rejected.iter().take(3).map(|r| format!("row {}: {}", r.row, r.reason)).collect();
+            notes.push(format!("{} rows rejected; e.g. {}", rejected.len(), sample.join("; ")));
+        }
+        if !failures.is_empty() {
+            let detail: Vec<String> = failures.iter().map(|f| format!("{} ({})", f.source, f.error)).collect();
+            notes.push(format!("{} source(s) failed: {}", failures.len(), detail.join("; ")));
+        }
+        let status = if notes.is_empty() { RunStatus::Success } else { RunStatus::Partial };
+        let outcome = RunOutcome {
+            status,
+            rows_in,
+            rows_out: rows_ok,
+            rows_rejected: rejected.len(),
+            message: (!notes.is_empty()).then(|| notes.join(" | ")),
+            failures,
+        };
+        self.sink.finish_run(id, outcome).await
     }
 }

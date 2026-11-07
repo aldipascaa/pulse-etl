@@ -52,6 +52,15 @@ impl Metric {
         }
     }
 
+    /// Typical sensor/measurement noise; the floor for the anomaly baseline spread.
+    pub fn min_spread(self) -> f64 {
+        match self {
+            Metric::Temperature => 0.5,
+            Metric::Humidity => 2.0,
+            Metric::Wind => 1.0,
+        }
+    }
+
     pub fn parse(s: &str) -> Option<Metric> {
         Metric::ALL.into_iter().find(|m| m.as_str().eq_ignore_ascii_case(s.trim()))
     }
@@ -82,6 +91,48 @@ pub struct DailyAgg {
     pub anomaly: bool,
 }
 
+/// Lifecycle state of a pipeline run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunStatus {
+    Running,
+    /// Everything extracted and loaded, nothing rejected.
+    Success,
+    /// Loaded, but some rows were rejected or some sources failed.
+    Partial,
+    Failed,
+}
+
+impl RunStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunStatus::Running => "running",
+            RunStatus::Success => "success",
+            RunStatus::Partial => "partial",
+            RunStatus::Failed => "failed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<RunStatus> {
+        [RunStatus::Running, RunStatus::Success, RunStatus::Partial, RunStatus::Failed]
+            .into_iter()
+            .find(|v| v.as_str() == s)
+    }
+}
+
+impl std::fmt::Display for RunStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One sub-source (for example a city) that could not be fetched during a run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourceFailure {
+    pub source: String,
+    pub error: String,
+}
+
 /// One pipeline execution as stored in the `runs` table.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunRecord {
@@ -92,7 +143,8 @@ pub struct RunRecord {
     pub rows_in: i64,
     pub rows_out: i64,
     pub rows_rejected: i64,
-    /// `running`, `success`, `partial` (some rows rejected) or `failed`.
-    pub status: String,
+    pub status: RunStatus,
     pub message: Option<String>,
+    /// Sub-sources that failed even though the run as a whole may have succeeded.
+    pub failures: Vec<SourceFailure>,
 }

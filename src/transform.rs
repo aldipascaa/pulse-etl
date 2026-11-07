@@ -128,15 +128,54 @@ pub fn std_dev(xs: &[f64]) -> f64 {
     (xs.iter().map(|x| (x - m).powi(2)).sum::<f64>() / xs.len() as f64).sqrt()
 }
 
-/// Z-score of every element against the whole series. Series that are too short
-/// (< 3 points) or constant yield zeros, so they can never be flagged.
-pub fn z_scores(xs: &[f64]) -> Vec<f64> {
-    let sd = std_dev(xs);
-    if xs.len() < 3 || sd < 1e-9 {
-        return vec![0.0; xs.len()];
+/// Tunables for anomaly detection.
+///
+/// A day is judged against a *trailing baseline*: the daily averages of the previous
+/// `window_days` calendar days. The day itself is never part of its own baseline, and days
+/// that were gross outliers (|z| at least twice the threshold) are left out, so one spike
+/// cannot inflate the spread and hide the days that follow it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AnomalyConfig {
+    /// |z| at or above this marks a day as anomalous.
+    pub z_threshold: f64,
+    /// Length of the trailing baseline window, in calendar days.
+    pub window_days: u32,
+    /// Minimum number of baseline days required before a day can be scored at all.
+    pub min_baseline: u32,
+}
+
+impl Default for AnomalyConfig {
+    fn default() -> Self {
+        AnomalyConfig { z_threshold: DEFAULT_Z_THRESHOLD, window_days: ROLLING_DAYS as u32, min_baseline: 3 }
     }
-    let m = mean(xs);
-    xs.iter().map(|x| (x - m) / sd).collect()
+}
+
+/// Trailing-window z-scores. Returns `(z, anomaly)` per input day; `days` must be sorted ascending.
+///
+/// `min_spread` is a noise floor for the baseline standard deviation (in the metric's own unit):
+/// in a very calm week the raw deviation is tiny, and without a floor an ordinary wiggle would
+/// score as a huge z. A day with fewer than `min_baseline` usable baseline days scores 0 and is
+/// never flagged.
+pub fn rolling_z_scores(days: &[NaiveDate], values: &[f64], cfg: &AnomalyConfig, min_spread: f64) -> (Vec<f64>, Vec<bool>) {
+    let n = values.len();
+    let mut z = vec![0.0; n];
+    let mut flagged = vec![false; n];
+    let mut gross = vec![false; n];
+    let min_baseline = cfg.min_baseline.max(2) as usize;
+    let floor = min_spread.max(1e-9);
+    for i in 0..n {
+        let baseline: Vec<f64> = (0..i)
+            .filter(|&j| !gross[j] && (days[i] - days[j]).num_days() <= i64::from(cfg.window_days))
+            .map(|j| values[j])
+            .collect();
+        if baseline.len() < min_baseline {
+            continue;
+        }
+        z[i] = (values[i] - mean(&baseline)) / std_dev(&baseline).max(floor);
+        flagged[i] = z[i].abs() >= cfg.z_threshold;
+        gross[i] = z[i].abs() >= 2.0 * cfg.z_threshold;
+    }
+    (z, flagged)
 }
 
 /// Trailing mean over a calendar window of `window` days (inclusive of the current day).
@@ -150,9 +189,9 @@ pub fn rolling_mean(days: &[NaiveDate], values: &[f64], window: i64) -> Vec<f64>
         .collect()
 }
 
-/// Build daily aggregates (min/max/avg, rolling 7-day average, z-score, anomaly flag)
+/// Build daily aggregates (min/max/avg, rolling 7-day average, trailing-window z-score, anomaly flag)
 /// for every city/metric present in `readings`.
-pub fn aggregate(readings: &[Reading], z_threshold: f64) -> Vec<DailyAgg> {
+pub fn aggregate(readings: &[Reading], cfg: &AnomalyConfig) -> Vec<DailyAgg> {
     let mut groups: BTreeMap<(String, Metric), BTreeMap<NaiveDate, Vec<f64>>> = BTreeMap::new();
     for r in readings {
         let Some(day) = r.ts.get(..10).and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()) else {
@@ -166,7 +205,7 @@ pub fn aggregate(readings: &[Reading], z_threshold: f64) -> Vec<DailyAgg> {
         let days: Vec<NaiveDate> = by_day.keys().copied().collect();
         let avgs: Vec<f64> = by_day.values().map(|v| mean(v)).collect();
         let rolling = rolling_mean(&days, &avgs, ROLLING_DAYS);
-        let zs = z_scores(&avgs);
+        let (zs, flags) = rolling_z_scores(&days, &avgs, cfg, metric.min_spread());
         for (i, (day, vals)) in by_day.iter().enumerate() {
             out.push(DailyAgg {
                 city: city.clone(),
@@ -178,7 +217,7 @@ pub fn aggregate(readings: &[Reading], z_threshold: f64) -> Vec<DailyAgg> {
                 count: vals.len() as u32,
                 rolling7: round(rolling[i], 2),
                 zscore: round(zs[i], 3),
-                anomaly: zs[i].abs() >= z_threshold,
+                anomaly: flags[i],
             });
         }
     }
@@ -188,6 +227,8 @@ pub fn aggregate(readings: &[Reading], z_threshold: f64) -> Vec<DailyAgg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SPREAD: f64 = 0.1;
 
     fn raw(city: &str, ts: &str, t: &str, unit: &str, h: &str, w: &str) -> RawRow {
         let o = |s: &str| if s.is_empty() { None } else { Some(s.to_string()) };
@@ -245,7 +286,7 @@ mod tests {
             reading("A", "2026-10-01T18:00", 30.0),
             reading("A", "2026-10-02T00:00", 5.0),
         ];
-        let d = aggregate(&rs, 2.0);
+        let d = aggregate(&rs, &AnomalyConfig::default());
         assert_eq!(d.len(), 2);
         assert_eq!((d[0].min, d[0].max, d[0].avg, d[0].count), (10.0, 30.0, 20.0, 3));
         assert_eq!(d[1].day, "2026-10-02");
@@ -267,22 +308,77 @@ mod tests {
         assert_eq!(r[2], 100.0);
     }
 
-    #[test]
-    fn zscore_flags_spike_only() {
-        let mut series = vec![10.0; 10];
-        series[4] = 10.5;
-        series[7] = 30.0;
-        let z = z_scores(&series);
-        assert!(z[7] > 2.5);
-        assert!(z.iter().enumerate().all(|(i, v)| i == 7 || v.abs() < 2.0));
-        assert!((mean(&z)).abs() < 1e-9);
+    fn days(n: u32) -> Vec<NaiveDate> {
+        (1..=n).map(|d| NaiveDate::from_ymd_opt(2026, 10, d).unwrap()).collect()
     }
 
     #[test]
-    fn constant_or_short_series_have_no_anomalies() {
-        assert_eq!(z_scores(&[5.0; 6]), vec![0.0; 6]);
-        assert_eq!(z_scores(&[1.0, 100.0]), vec![0.0, 0.0]);
-        assert!(z_scores(&[]).is_empty());
+    fn rolling_zscore_flags_spike_and_keeps_baseline_clean() {
+        let mut v: Vec<f64> = (0..14).map(|i| 10.0 + (i % 3) as f64 * 0.3).collect();
+        v[8] = 30.0;
+        let (z, flags) = rolling_z_scores(&days(14), &v, &AnomalyConfig::default(), SPREAD);
+        assert!(flags[8] && z[8] > 5.0, "z = {}", z[8]);
+        // The spike does not poison the baseline: the day after is normal, not masked or flagged.
+        assert!(!flags[9] && z[9].abs() < 2.0, "z9 = {}", z[9]);
+        assert_eq!(flags.iter().filter(|f| **f).count(), 1);
+    }
+
+    #[test]
+    fn rolling_zscore_adapts_to_a_trend_unlike_a_global_one() {
+        // A steady climb of 1 degree/day: every day is "normal" relative to the recent past,
+        // but a global z-score would flag both ends of the series.
+        let v: Vec<f64> = (0..20).map(|i| 5.0 + f64::from(i) + if i % 2 == 0 { 0.2 } else { -0.2 }).collect();
+        let cfg = AnomalyConfig { z_threshold: 4.0, ..AnomalyConfig::default() };
+        let (_, flags) = rolling_z_scores(&days(20), &v, &cfg, SPREAD);
+        assert!(flags.iter().all(|f| !f));
+    }
+
+    #[test]
+    fn rolling_zscore_needs_a_baseline() {
+        let (z, f) = rolling_z_scores(&days(3), &[1.0, 1.5, 100.0], &AnomalyConfig::default(), SPREAD);
+        assert_eq!(z, vec![0.0; 3]);
+        assert_eq!(f, vec![false; 3]);
+        let (_, f) = rolling_z_scores(&days(5), &[1.0, 1.5, 0.5, 1.0, 100.0], &AnomalyConfig::default(), SPREAD);
+        assert!(f[4], "fifth day has three baseline days and must be scored");
+        assert!(rolling_z_scores(&[], &[], &AnomalyConfig::default(), SPREAD).0.is_empty());
+    }
+
+    #[test]
+    fn rolling_zscore_window_is_configurable_and_calendar_based() {
+        // Values far in the past fall out of the window.
+        let d = |n: u32| NaiveDate::from_ymd_opt(2026, 10, n).unwrap();
+        let ds = vec![d(1), d(2), d(3), d(4), d(20)];
+        let vs = vec![0.0, 1.0, 0.0, 1.0, 50.0];
+        let (_, f) = rolling_z_scores(&ds, &vs, &AnomalyConfig::default(), SPREAD);
+        assert!(!f[4], "baseline from 16 days ago is outside the 7-day window");
+        let wide = AnomalyConfig { window_days: 30, ..AnomalyConfig::default() };
+        let (_, f) = rolling_z_scores(&ds, &vs, &wide, SPREAD);
+        assert!(f[4]);
+    }
+
+    #[test]
+    fn calm_baseline_uses_the_noise_floor_instead_of_exploding() {
+        // A perfectly flat week: no deviation, no score; a real jump still stands out.
+        let (z, f) = rolling_z_scores(&days(8), &[5.0; 8], &AnomalyConfig::default(), 0.5);
+        assert_eq!(z, vec![0.0; 8]);
+        assert!(f.iter().all(|x| !x));
+        let (z, f) = rolling_z_scores(&days(5), &[5.0, 5.0, 5.0, 5.0, 9.0], &AnomalyConfig::default(), 0.5);
+        assert!(f[4] && (z[4] - 8.0).abs() < 1e-9);
+        // A small wiggle in a calm period is below the floor, not a "z = 40" event.
+        let (_, f) = rolling_z_scores(&days(5), &[5.0, 5.0, 5.0, 5.0, 5.3], &AnomalyConfig::default(), 0.5);
+        assert!(!f[4]);
+    }
+
+    #[test]
+    fn gross_outliers_do_not_poison_later_baselines_but_mild_shifts_adapt() {
+        // A level shift from 10 to 11 (z just above the threshold with a 0.3 floor) is flagged
+        // briefly, then becomes the new normal because mildly-flagged days stay in the baseline.
+        let mut v = vec![10.0, 10.1, 9.9, 10.0, 10.1, 9.9];
+        v.extend([11.0; 8]);
+        let cfg = AnomalyConfig { z_threshold: 2.0, ..AnomalyConfig::default() };
+        let (_, f) = rolling_z_scores(&days(14), &v, &cfg, 0.3);
+        assert!(f[6], "the shift itself is flagged");
+        assert!(!f[13], "a week later it is normal: {f:?}");
     }
 
     #[test]
@@ -293,7 +389,7 @@ mod tests {
             rs.push(reading("Berlin", &format!("2026-10-{day:02}T12:00"), v));
         }
         rs.push(reading("Oslo", "2026-10-01T12:00", 1.0)); // separate series, untouched
-        let d = aggregate(&rs, DEFAULT_Z_THRESHOLD);
+        let d = aggregate(&rs, &AnomalyConfig::default());
         let flagged: Vec<_> = d.iter().filter(|x| x.anomaly).collect();
         assert_eq!(flagged.len(), 1);
         assert_eq!(flagged[0].day, "2026-10-08");
