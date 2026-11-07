@@ -55,6 +55,21 @@ async function api(path, opts) {
   if (!r.ok) throw Object.assign(new Error(body.error || r.statusText), { status: r.status });
   return body;
 }
+// Optional API token for POST /api/ingest (only needed when the server sets PULSE_API_TOKEN).
+const tokenStore = {
+  get() { try { return sessionStorage.getItem("pulse-token") || ""; } catch (e) { return ""; } },
+  set(v) { try { v ? sessionStorage.setItem("pulse-token", v) : sessionStorage.removeItem("pulse-token"); } catch (e) { /* ignore */ } },
+};
+async function ingest() {
+  const call = () => { const t = tokenStore.get(); return api("/api/ingest", { method: "POST", headers: t ? { Authorization: "Bearer " + t } : {} }); };
+  try { return await call(); } catch (e) {
+    if (e.status !== 401) throw e;
+    const t = window.prompt("This server protects \"Run now\" with an API token. Enter it:");
+    if (!t) throw e;
+    tokenStore.set(t.trim());
+    try { return await call(); } catch (e2) { if (e2.status === 401) tokenStore.set(""); throw e2; }
+  }
+}
 const badge = (status) => el("span", { class: "badge " + status, text: status });
 
 /* ---------- theme ---------- */
@@ -244,7 +259,7 @@ let seriesToken = 0;
 async function loadSeries() {
   const token = ++seriesToken;
   if (!state.city) { state.series = null; drawChart($("chart"), { points: [] }); renderKpis(); return; }
-  const q = (c) => api(`/api/series?city=${encodeURIComponent(c)}&metric=${state.metric}`);
+  const q = (c) => api(`/api/series?city=${encodeURIComponent(c)}&metric=${state.metric}&limit=1000`);
   const [main, ...rest] = await Promise.all([q(state.city), ...state.overview.cities.map((c) => q(c).then((data) => ({ city: c, data })))]);
   if (token !== seriesToken) return;
   state.series = main;
@@ -290,10 +305,10 @@ $("run").addEventListener("click", async () => {
   const b = $("run");
   b.setAttribute("aria-busy", "true"); b.disabled = true; $("run-label").textContent = "Running…";
   try {
-    const r = await api("/api/ingest", { method: "POST" });
-    toast(`Run #${r.id} ${r.status}: ${int(r.rows_out)} rows loaded, ${int(r.rows_rejected)} rejected`);
+    const r = await ingest();
+    toast(`Run #${r.id} ${r.status}: ${int(r.rows_out)} rows loaded, ${int(r.rows_rejected)} rejected` + (r.failures.length ? `, ${r.failures.length} source(s) failed` : ""));
   } catch (e) {
-    toast(e.status === 409 ? "A run is already in progress" : "Run failed: " + e.message);
+    toast(e.status === 409 ? "A run is already in progress" : e.status === 401 ? "Run not authorised: wrong or missing API token" : "Run failed: " + e.message);
   } finally {
     state.running = false; b.removeAttribute("aria-busy"); b.disabled = false; $("run-label").textContent = "Run now";
     refresh(false);
