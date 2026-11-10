@@ -193,3 +193,7 @@ tbody tr:last-child td { border-bottom: 0; }
   table.runs td::before { content: attr(data-label); color: var(--muted); font-weight: 600; text-align: left; }
   .notes { max-width: none; }
 }
+
+.export { margin: 10px 0 0; display: flex; justify-content: flex-end; }
+a.btn { text-decoration: none; display: inline-flex; align-items: center; color: inherit; }
+a.btn[hidden] { display: none; }

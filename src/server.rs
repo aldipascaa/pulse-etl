@@ -129,6 +129,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/health", get(health))
         .route("/api/metrics", get(metrics))
         .route("/api/series", get(series))
+        .route("/api/export", get(export))
         .route("/api/runs", get(runs))
         .route("/api/ingest", post(ingest))
         .fallback(not_found)
@@ -195,7 +196,17 @@ fn parse_day(name: &str, v: Option<String>) -> Result<Option<String>, ApiError> 
     }
 }
 
-async fn series(State(s): State<AppState>, ApiQuery(p): ApiQuery<SeriesParams>) -> ApiResult<serde_json::Value> {
+/// Validated form of [`SeriesParams`], shared by the JSON series and the CSV export.
+struct SeriesQuery {
+    city: String,
+    metric: Metric,
+    from: Option<String>,
+    to: Option<String>,
+    limit: Option<u32>,
+    offset: u32,
+}
+
+fn series_query(p: SeriesParams) -> Result<SeriesQuery, ApiError> {
     let city = p
         .city
         .map(|c| c.trim().to_string())
@@ -214,11 +225,17 @@ async fn series(State(s): State<AppState>, ApiQuery(p): ApiQuery<SeriesParams>) 
             return Err(ApiError::bad_request("'from' must not be after 'to'"));
         }
     }
+    Ok(SeriesQuery { city, metric, from, to, limit: p.limit, offset: p.offset.unwrap_or(0) })
+}
+
+async fn series(State(s): State<AppState>, ApiQuery(p): ApiQuery<SeriesParams>) -> ApiResult<serde_json::Value> {
+    let q = series_query(p)?;
+    let (city, metric) = (q.city, q.metric);
     let filter = SeriesFilter {
-        from,
-        to,
-        limit: p.limit.unwrap_or(DEFAULT_SERIES_LIMIT).clamp(1, MAX_SERIES_LIMIT),
-        offset: p.offset.unwrap_or(0),
+        from: q.from,
+        to: q.to,
+        limit: q.limit.unwrap_or(DEFAULT_SERIES_LIMIT).clamp(1, MAX_SERIES_LIMIT),
+        offset: q.offset,
     };
     let (limit, offset) = (filter.limit, filter.offset);
     let (city_q, filter_q) = (city.clone(), filter.clone());
@@ -235,6 +252,58 @@ async fn series(State(s): State<AppState>, ApiQuery(p): ApiQuery<SeriesParams>) 
         "offset": offset,
         "points": page.points,
     })))
+}
+
+/// Rows one CSV export may contain (about 27 years of daily values).
+const MAX_EXPORT_ROWS: u32 = 10_000;
+
+/// Quote a CSV field when it needs it, and defuse spreadsheet formulas in text fields.
+fn csv_text(s: &str) -> String {
+    let s = if s.starts_with(['=', '+', '-', '@']) { format!("'{s}") } else { s.to_string() };
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s
+    }
+}
+
+/// `GET /api/export`: the daily series of one city and metric as a CSV download.
+/// Takes the same `city`, `metric`, `from` and `to` as `/api/series`; `limit` and `offset` are ignored.
+async fn export(State(s): State<AppState>, ApiQuery(p): ApiQuery<SeriesParams>) -> Result<Response, ApiError> {
+    let q = series_query(p)?;
+    let (city, metric) = (q.city, q.metric);
+    let filter = SeriesFilter { from: q.from, to: q.to, limit: MAX_EXPORT_ROWS, offset: 0 };
+    let city_q = city.clone();
+    let page = s.db.blocking(move |db| db.series_page(&city_q, metric, &filter)).await?;
+
+    let mut csv = String::from("city,metric,unit,day,min,max,avg,rolling7,zscore,anomaly,readings\n");
+    for p in &page.points {
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{}\n",
+            csv_text(&p.city),
+            metric.as_str(),
+            csv_text(metric.unit()),
+            p.day,
+            p.min,
+            p.max,
+            p.avg,
+            p.rolling7,
+            p.zscore,
+            p.anomaly,
+            p.count
+        ));
+    }
+    let safe: String = city.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect();
+    let disposition = format!("attachment; filename=\"pulse-{}-{}.csv\"", safe.trim_matches('-'), metric.as_str());
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
+            (header::CONTENT_DISPOSITION, disposition),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        csv,
+    )
+        .into_response())
 }
 
 #[derive(Deserialize)]

@@ -264,6 +264,9 @@ async function loadSeries() {
   if (token !== seriesToken) return;
   state.series = main;
   $("chart-title").textContent = `${main.label} · ${main.city}`;
+  const ex = $("export");
+  ex.href = `/api/export?city=${encodeURIComponent(main.city)}&metric=${state.metric}`;
+  ex.hidden = !main.points.length;
   drawChart($("chart"), main);
   drawTable(main);
   renderCities(rest);

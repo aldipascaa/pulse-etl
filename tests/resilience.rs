@@ -46,8 +46,8 @@ async fn spawn_mock() -> String {
     url
 }
 
-fn city(name: &'static str, lat: f64, lon: f64) -> City {
-    City { name, lat, lon }
+fn city(name: &str, lat: f64, lon: f64) -> City {
+    City::new(name, lat, lon)
 }
 
 fn open_meteo(url: String, cities: Vec<City>) -> OpenMeteoSource {

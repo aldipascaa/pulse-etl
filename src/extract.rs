@@ -112,20 +112,66 @@ where
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// A place to fetch weather for.
+#[derive(Debug, Clone, PartialEq)]
 pub struct City {
-    pub name: &'static str,
+    pub name: String,
     pub lat: f64,
     pub lon: f64,
 }
 
-pub const CITIES: &[City] = &[
-    City { name: "Berlin", lat: 52.52, lon: 13.41 },
-    City { name: "Tokyo", lat: 35.68, lon: 139.69 },
-    City { name: "New York", lat: 40.71, lon: -74.01 },
-    City { name: "Sydney", lat: -33.87, lon: 151.21 },
-    City { name: "Nairobi", lat: -1.29, lon: 36.82 },
-];
+impl City {
+    pub fn new(name: impl Into<String>, lat: f64, lon: f64) -> City {
+        City { name: name.into(), lat, lon }
+    }
+}
+
+/// The cities fetched when none are configured.
+pub fn default_cities() -> Vec<City> {
+    vec![
+        City::new("Berlin", 52.52, 13.41),
+        City::new("Tokyo", 35.68, 139.69),
+        City::new("New York", 40.71, -74.01),
+        City::new("Sydney", -33.87, 151.21),
+        City::new("Nairobi", -1.29, 36.82),
+    ]
+}
+
+/// Most cities one run may fetch (they are requested one after another).
+pub const MAX_CITIES: usize = 25;
+
+/// Parse a city list like `Jakarta:-6.2:106.8;Paris:48.85:2.35`.
+/// Names must be unique (case-insensitive); latitude is -90..=90 and longitude -180..=180.
+pub fn parse_cities(spec: &str) -> Result<Vec<City>, String> {
+    let mut out: Vec<City> = Vec::new();
+    for part in spec.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+        let fields: Vec<&str> = part.split(':').map(str::trim).collect();
+        let [name, lat, lon] = fields[..] else {
+            return Err(format!("'{part}' is not NAME:LAT:LON"));
+        };
+        if name.is_empty() || name.chars().count() > 60 {
+            return Err(format!("city name in '{part}' must be 1-60 characters"));
+        }
+        let coord = |what: &str, v: &str, max: f64| -> Result<f64, String> {
+            match v.parse::<f64>() {
+                Ok(x) if x.is_finite() && x.abs() <= max => Ok(x),
+                _ => Err(format!("{what} '{v}' of {name} must be a number between -{max} and {max}")),
+            }
+        };
+        let city = City::new(name, coord("latitude", lat, 90.0)?, coord("longitude", lon, 180.0)?);
+        if out.iter().any(|c| c.name.eq_ignore_ascii_case(&city.name)) {
+            return Err(format!("city '{name}' is listed twice"));
+        }
+        out.push(city);
+    }
+    if out.is_empty() {
+        return Err("no cities given; expected NAME:LAT:LON[;NAME:LAT:LON...]".into());
+    }
+    if out.len() > MAX_CITIES {
+        return Err(format!("at most {MAX_CITIES} cities are supported"));
+    }
+    Ok(out)
+}
 
 #[derive(Deserialize)]
 struct OmResponse {
@@ -178,7 +224,7 @@ impl OpenMeteoSource {
             past_days,
             attempts: 4,
             backoff: Duration::from_secs(2),
-            cities: CITIES.to_vec(),
+            cities: default_cities(),
             client,
         })
     }
@@ -219,7 +265,7 @@ impl Source for OpenMeteoSource {
             })
             .await;
             match res {
-                Ok(r) => out.rows.extend(om_to_rows(c.name, r.hourly)),
+                Ok(r) => out.rows.extend(om_to_rows(&c.name, r.hourly)),
                 Err(e) => {
                     tracing::error!("fetching {} failed: {e}", c.name);
                     out.failures.push(SourceFailure { source: c.name.to_string(), error: e.to_string() });
@@ -242,6 +288,21 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn parse_cities_accepts_a_valid_list() {
+        let c = parse_cities(" Jakarta:-6.2:106.8 ; New York : 40.71 : -74.01 ;").unwrap();
+        assert_eq!(c, vec![City::new("Jakarta", -6.2, 106.8), City::new("New York", 40.71, -74.01)]);
+    }
+
+    #[test]
+    fn parse_cities_rejects_bad_input() {
+        for bad in ["", " ; ", "Paris", "Paris:48.85", "Paris:48.85:2.35:9", ":1:2", "Paris:north:2", "Paris:91:2", "Paris:48:181", "Paris:NaN:2", "Paris:1:2;paris:3:4"] {
+            assert!(parse_cities(bad).is_err(), "{bad:?} should be rejected");
+        }
+        let many = (0..=MAX_CITIES).map(|i| format!("c{i}:1:2")).collect::<Vec<_>>().join(";");
+        assert!(parse_cities(&many).is_err());
+    }
 
     #[tokio::test]
     async fn retry_succeeds_after_transient_failures() {

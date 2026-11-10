@@ -6,13 +6,13 @@ loads it into SQLite, and serves a JSON API plus a responsive dashboard from a s
 
 ## Features
 
-- **Extract**: pluggable `Source` trait. Open-Meteo hourly data for 5 cities (reqwest, per-city retries with exponential backoff) or any CSV file (works offline; sample in `data/`).
+- **Extract**: pluggable `Source` trait. Open-Meteo hourly data for five default cities or your own `--cities` list (reqwest, per-city retries with exponential backoff) or any CSV file (works offline; sample in `data/`).
 - **Transform**: validation and range checks, bad rows rejected and counted, F/K converted to C, daily min/max/avg, rolling 7-day average, trailing-window z-score anomaly flag (default |z| >= 2.0 against the previous 7 days).
 - **Load**: pluggable `Sink` trait; SQLite with idempotent upserts (re-running never duplicates), daily aggregates rebuilt atomically, versioned migrations.
 - **Run tracking**: every execution is a row in `runs` (start/end, rows in/out/rejected, status `success`, `partial`, `failed`) and per-source failures (for example one city that could not be fetched) are stored with the run, not just logged.
 - **Scheduler**: tokio interval; `run` ingests on start and then every `--interval-secs`; never overlaps runs; stops cleanly on Ctrl-C / SIGTERM.
 - **API**: JSON, paginated series, consistent error bodies, optional bearer token on the one mutating endpoint.
-- **Dashboard**: KPI tiles, per-city/metric line charts with min-max band and anomaly markers, all-cities sparklines, run history, "Run now", light/dark mode, phone-friendly, accessible (keyboard chart navigation, data table fallback). Assets are embedded in the binary; no CDNs.
+- **Dashboard**: KPI tiles, per-city/metric line charts with min-max band and anomaly markers, all-cities sparklines, run history, CSV download of the selected series, "Run now", light/dark mode, phone-friendly, accessible (keyboard chart navigation, data table fallback). Assets are embedded in the binary; no CDNs.
 
 ## Architecture
 
@@ -78,6 +78,7 @@ Every option can also be set through a `PULSE_*` environment variable.
 | `--db` | `PULSE_DB` | `pulse.db` | SQLite file, created and migrated on open |
 | `--csv` | `PULSE_CSV` | none | Use a CSV instead of the API |
 | `--past-days` | `PULSE_PAST_DAYS` | 14 | 1 to 92 |
+| `--cities` | `PULSE_CITIES` | Berlin, Tokyo, New York, Sydney, Nairobi | `NAME:LAT:LON;NAME:LAT:LON`, up to 25 cities, e.g. `Jakarta:-6.2:106.8;Paris:48.85:2.35` |
 | `--z-threshold` | `PULSE_Z_THRESHOLD` | 2.0 | Positive |
 | `--anomaly-window` | `PULSE_ANOMALY_WINDOW` | 7 | Trailing baseline, days (2 to 90) |
 | `--min-baseline` | `PULSE_MIN_BASELINE` | 3 | Baseline days needed to score a day (2 to 30) |
@@ -109,6 +110,7 @@ All errors have the shape `{"error": "message", "code": "bad_request"}`.
 | --- | --- | --- |
 | GET | `/api/health` | Status, version, schema version, source, whether ingest is protected, last run |
 | GET | `/api/metrics` | Totals, cities, metrics, latest daily values, recent anomalies, last run |
+| GET | `/api/export?city=&metric=&from=&to=` | The same daily series as a CSV download (up to 10,000 rows) |
 | GET | `/api/series?city=&metric=&from=&to=&limit=&offset=` | Daily series (`temperature`, `humidity`, `wind`) in ascending day order with min/max/avg, rolling7, zscore, anomaly. `from`/`to` are inclusive `YYYY-MM-DD`; `limit` defaults to 366 (max 1000); response includes `total`, `limit`, `offset` |
 | GET | `/api/runs?limit=` | Pipeline run history, newest first, each with its `failures` list |
 | POST | `/api/ingest` | Trigger a run now. `409` if one is in progress; `401` without `Authorization: Bearer <token>` when a token is configured |

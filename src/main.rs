@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use pulse_etl::db::Db;
-use pulse_etl::extract::{CsvSource, OpenMeteoSource, Source, OPEN_METEO_URL};
+use pulse_etl::extract::{parse_cities, City, CsvSource, OpenMeteoSource, Source, OPEN_METEO_URL};
 use pulse_etl::model::RunStatus;
 use pulse_etl::pipeline::Pipeline;
 use pulse_etl::scheduler::{run_scheduler, Runner};
@@ -27,6 +27,14 @@ fn positive_f64(s: &str) -> Result<f64, String> {
     }
 }
 
+/// A validated `--cities` value.
+#[derive(Clone)]
+struct CityList(Vec<City>);
+
+fn city_list(s: &str) -> Result<CityList, String> {
+    parse_cities(s).map(CityList)
+}
+
 #[derive(Parser)]
 #[command(name = "pulse-etl", version, about = "ETL pipeline + analytics dashboard (Open-Meteo / CSV -> SQLite)")]
 struct Cli {
@@ -42,6 +50,9 @@ struct SourceArgs {
     /// Ingest this CSV file instead of calling the Open-Meteo API (works offline).
     #[arg(long, env = "PULSE_CSV")]
     csv: Option<PathBuf>,
+    /// Cities to fetch from the API as `NAME:LAT:LON;NAME:LAT:LON` (default: five world cities).
+    #[arg(long, value_parser = city_list, env = "PULSE_CITIES", value_name = "LIST")]
+    cities: Option<CityList>,
     /// Days of history requested from the API (Open-Meteo allows up to 92).
     #[arg(long, default_value_t = 14, value_parser = clap::value_parser!(u32).range(1..=92), env = "PULSE_PAST_DAYS")]
     past_days: u32,
@@ -92,7 +103,13 @@ enum Cmd {
 fn build_pipeline(src: &SourceArgs, db: &Db) -> Result<Arc<Pipeline>> {
     let source: Arc<dyn Source> = match &src.csv {
         Some(path) => Arc::new(CsvSource::new(path)),
-        None => Arc::new(OpenMeteoSource::new(OPEN_METEO_URL, src.past_days)?),
+        None => {
+            let api = OpenMeteoSource::new(OPEN_METEO_URL, src.past_days)?;
+            Arc::new(match &src.cities {
+                Some(list) => api.with_cities(list.0.clone()),
+                None => api,
+            })
+        }
     };
     let anomaly =
         AnomalyConfig { z_threshold: src.z_threshold, window_days: src.anomaly_window, min_baseline: src.min_baseline };

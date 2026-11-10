@@ -139,3 +139,43 @@ async fn open_by_default_without_token() {
     let (st, _) = call(&app(Some("")), "POST", "/api/ingest").await;
     assert_eq!(st, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn export_returns_the_series_as_csv() {
+    let app = app(None);
+    call(&app, "POST", "/api/ingest").await;
+
+    let (_, series) = call(&app, "GET", "/api/series?city=Berlin&metric=temperature&limit=1000").await;
+    let points = series["points"].as_array().unwrap();
+    assert!(!points.is_empty());
+
+    let req = Request::builder().uri("/api/export?city=Berlin&metric=temperature").body(Body::empty()).unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "text/csv; charset=utf-8");
+    assert_eq!(resp.headers()["content-disposition"], "attachment; filename=\"pulse-berlin-temperature.csv\"");
+    let body = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(lines[0], "city,metric,unit,day,min,max,avg,rolling7,zscore,anomaly,readings");
+    assert_eq!(lines.len(), points.len() + 1, "one row per day plus the header");
+    let first: Vec<&str> = lines[1].split(',').collect();
+    assert_eq!(first.len(), 11);
+    assert_eq!(first[0], "Berlin");
+    assert_eq!(first[3], points[0]["day"].as_str().unwrap());
+    assert_eq!(first[6].parse::<f64>().unwrap(), points[0]["avg"].as_f64().unwrap());
+    let anomalies = points.iter().filter(|p| p["anomaly"] == true).count();
+    assert_eq!(lines[1..].iter().filter(|l| l.split(',').nth(9) == Some("true")).count(), anomalies);
+
+    // A date range narrows the export; an unknown city is just an empty file.
+    let day = points[0]["day"].as_str().unwrap();
+    let req = Request::builder().uri(format!("/api/export?city=Berlin&from={day}&to={day}")).body(Body::empty()).unwrap();
+    let body = app.clone().oneshot(req).await.unwrap().into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(String::from_utf8(body.to_vec()).unwrap().lines().count(), 2);
+    let req = Request::builder().uri("/api/export?city=Atlantis").body(Body::empty()).unwrap();
+    let body = app.clone().oneshot(req).await.unwrap().into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(String::from_utf8(body.to_vec()).unwrap().lines().count(), 1);
+
+    // Same validation as /api/series.
+    assert_eq!(call(&app, "GET", "/api/export").await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(call(&app, "GET", "/api/export?city=Berlin&metric=rain").await.0, StatusCode::BAD_REQUEST);
+}

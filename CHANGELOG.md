@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.0 - 2026-11-10
+
+### Added
+- **Choose your own cities.** `--cities "NAME:LAT:LON;NAME:LAT:LON"` (or `PULSE_CITIES`) replaces the five
+  built-in cities for API ingests. The list is validated at startup: coordinates in range, no duplicate names,
+  at most 25 cities.
+- **CSV export.** `GET /api/export?city=&metric=&from=&to=` returns the daily series as a CSV download, and the
+  dashboard has a "Download CSV" button under the chart. Text fields are quoted and spreadsheet formulas
+  defused.
+- GitHub Actions workflow: clippy with `-D warnings` and tests on every push and pull request.
+
+### Changed
+- `extract::City` owns its name (`String`) and `CITIES` became `default_cities()` (library API).
+
 ## 1.1.0 - 2026-11-08
 
 Architecture review and repair; see `ARCHITECTURE_REVIEW.md` for the findings behind each item.
